@@ -94,6 +94,7 @@ python codex_model_watch.py --demo
 | `--no-open` | 不自动打开浏览器 |
 
 数据库存在 `~/.codex-model-watch/state.db`（SQLite），重复启动是增量解析，不会重复计数。
+数据库保留 UTC 时间；面板记录、图表及额度重置时间按浏览器本地时区显示，顶部标明时区。
 
 ## 探针怎么用
 

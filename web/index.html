@@ -171,6 +171,24 @@ const charts={};
 const $=s=>document.querySelector(s);
 const fmt=n=>(n??0).toLocaleString();
 const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const localZone=Intl.DateTimeFormat().resolvedOptions().timeZone;
+function localTime(value, full=false, seconds=false){
+  if(value==null||value==='')return '—';
+  let timestamp=value;
+  if(typeof value==='number'||/^\d+$/.test(String(value))){
+    const n=Number(value);
+    timestamp=n<1e12?n*1000:n;
+  }else{
+    timestamp=String(value).replace(' ','T');
+    // Hourly buckets and older log timestamps omit the UTC suffix.
+    if(/T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(timestamp))timestamp+='Z';
+  }
+  const date=new Date(timestamp);
+  if(Number.isNaN(date.getTime()))return '—';
+  const pad=n=>String(n).padStart(2,'0');
+  return (full?date.getFullYear()+'-':'')+pad(date.getMonth()+1)+'-'+pad(date.getDate())+
+    ' '+pad(date.getHours())+':'+pad(date.getMinutes())+(seconds?':'+pad(date.getSeconds()):'');
+}
 let winSec=24*3600;
 const WINS=[['最近 1 小时',3600],['6 小时',6*3600],['24 小时',24*3600],['7 天',7*86400],['全部',0]];
 let dLast=null;
@@ -209,15 +227,15 @@ function render(d){
         `<span class="pct" style="color:${col}">${v==null?'?':Math.round(w)}%</span>`+
         `<span class="hint">${sub||''}</span></div>`;};
     const p=raw.primary||{}, sec=raw.secondary||{};
-    const rs=v=>{if(v==null)return'';if(v.reset_at)return '重置 '+String(v.reset_at).slice(0,16).replace('T',' ');
+    const rs=v=>{if(v==null)return'';if(v.reset_at!=null)return '重置 '+localTime(v.reset_at,true);
       if(v.reset_after_seconds!=null)return Math.round(v.reset_after_seconds/3600)+'h 后重置';return '';};
     qEl.innerHTML=bar('5h',q.primary_used,rs(p))+bar('7d',q.secondary_used,rs(sec))+
-      `<div class="hint" style="margin-top:4px">采样时间 ${String(q.ts).slice(0,19).replace('T',' ')}（额度为 Codex 上报的窗口用量百分比）</div>`;
+      `<div class="hint" style="margin-top:4px">采样时间 ${localTime(q.ts,true,true)}（额度为 Codex 上报的窗口用量百分比）</div>`;
   }
   const h=d.hourly||[];
   const step=Math.max(1,Math.ceil(h.length/160));
   const pts=h.filter((_,i)=>i%step===0||i===h.length-1);
-  const labels=pts.map(p=>(p.bucket||'').slice(5,13));
+  const labels=pts.map(p=>localTime(p.bucket).slice(0,8));
   const mk=(label,data,color,fill)=>({label,data,borderColor:color,backgroundColor:fill?color+'20':'transparent',
     borderWidth:1.6,pointRadius:0,tension:.3,fill:!!fill});
   const tCfg={type:'line',data:{labels,datasets:[
@@ -238,21 +256,21 @@ function render(d){
     (pr.length?pr.map(p=>`<tr><td>${p.project}</td><td>${fmt(p.turns)}</td><td>${fmtTok(p.tokens)}</td></tr>`).join(''):'<tr><td style="color:var(--dim)">暂无</td></tr>');
   const er=d.errors_recent||[];
   $('#tErr').innerHTML='<tr><th>时间</th><th>模型</th><th>类型</th><th>消息</th></tr>'+
-    (er.length?er.slice(0,12).map(e=>`<tr><td>${String(e.ts).slice(5,16).replace('T',' ')}</td><td>${modelBadge(e.model)}</td>
+    (er.length?er.slice(0,12).map(e=>`<tr><td>${localTime(e.ts)}</td><td>${modelBadge(e.model)}</td>
       <td><span class="badge ${e.error_kind==='capacity'||e.error_kind==='server_overloaded'?'b-bad':'b-warn'}">${e.error_kind}</span></td>
       <td style="text-align:left;color:var(--dim);font-size:12px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(e.error_msg||'').replace(/"/g,'')}">${e.error_msg||''}</td></tr>`).join(''):'<tr><td style="color:var(--ok)">没有错误 ✓</td></tr>');
   const probes=d.probes||[];
   $('#pNote').textContent=`共 ${fmt(ps.total||0)} 次探测 · 偷换 ${fmt(ps.swapped||0)} · 金丝雀可疑 ${fmt(ps.suspect||0)}`;
   $('#pSquares').innerHTML=probes.slice(0,60).reverse().map(p=>{
     const cls=p.verdict&&p.verdict.startsWith('suspect')?'swap':(p.swapped?'swap':(p.served?'ok':'err'));
-    const info=`${String(p.ts).slice(5,16).replace('T',' ')} · 请求 ${p.requested} → 实际 ${p.served||p.error||'?'}${p.verdict?' · '+p.verdict:''}`;
+    const info=`${localTime(p.ts)} · 请求 ${p.requested} → 实际 ${p.served||p.error||'?'}${p.verdict?' · '+p.verdict:''}`;
     return `<span class="sq ${cls}" title="${escapeHtml(info)}"></span>`;}).join('')||'<span class="hint">还没有探测记录</span>';
   $('#tProbe').innerHTML='<tr><th>时间</th><th>请求模型</th><th>服务端报告</th><th>结果</th><th>耗时</th><th>金丝雀</th></tr>'+
     (probes.length?probes.slice(0,15).map(p=>{
       const sw=p.swapped;
       const canary=p.verdict?(`<span class="badge ${p.verdict.startsWith('suspect')?'b-bad':'b-ok'}">${p.verdict}</span>`+
         (p.ttft_ms?`<span style="color:var(--dim);font-size:11px"> ${p.ttft_ms}ms/推理${p.reasoning??'?'}</span>`:'')):'—';
-      return `<tr><td>${String(p.ts).slice(5,16).replace('T',' ')}</td><td>${modelBadge(p.requested)}</td>
+      return `<tr><td>${localTime(p.ts)}</td><td>${modelBadge(p.requested)}</td>
         <td style="color:${sw?'var(--fail)':'var(--ok)'}">${escapeHtml(p.served)||(p.error?'<span style="color:var(--dim)">'+escapeHtml((p.error||'').slice(0,40))+'</span>':'?')}</td>
         <td>${sw?'<span class="badge b-bad">被偷换</span>':(p.served?'<span class="badge b-ok">一致</span>':'<span class="badge b-off">'+(p.error?'失败':'?')+'</span>')}</td>
         <td>${p.latency_ms?fmtDur(p.latency_ms):'—'}</td><td>${canary}</td></tr>`;}).join(''):'<tr><td colspan="6" style="color:var(--dim)">还没有探测记录 —— 在上面输入模型名点「立即探测」试试</td></tr>');
@@ -263,7 +281,7 @@ async function load(){
   try{d=await(await fetch('/api/data?days='+Math.ceil(winSec/86400))).json();}
   catch(e){$('#gen').textContent='无法连接本地服务';return;}
   dLast=d;
-  $('#gen').textContent='更新于 '+String(d.meta.generated_at||'').slice(0,19).replace('T',' ')+(d.meta.demo?' · 演示数据':'');
+  $('#gen').textContent='更新于 '+localTime(d.meta.generated_at,true,true)+' · 时区 '+localZone+(d.meta.demo?' · 演示数据':'');
   $('#demoBanner').style.display=d.meta.demo?'block':'none';
   render(d);
 }

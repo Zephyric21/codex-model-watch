@@ -99,6 +99,8 @@ Your browser opens `http://127.0.0.1:8787` automatically.
 
 The database lives at `~/.codex-model-watch/state.db` (SQLite). Repeated starts parse
 incrementally — nothing is counted twice.
+Timestamps remain UTC in the database. Records, charts, and quota reset times are displayed
+in the browser's local time zone, shown beside the dashboard update time.
 
 ## Using the probe
 
