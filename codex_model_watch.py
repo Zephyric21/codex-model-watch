@@ -260,9 +260,174 @@ def load_auth(codex_home):
         return None
 
 
-def run_probe(codex_home, model):
+def resolve_api(codex_home, api_base=None, api_key=None, api_format=None):
+    """Resolve the active provider without forwarding OAuth credentials."""
+    from urllib.parse import urlsplit
+    config = {}
+    if not api_base:
+        path = os.path.join(codex_home, "config.toml")
+        if os.path.isfile(path):
+            try:
+                import tomllib
+            except ImportError:
+                raise ValueError("自动读取 Codex 配置需要 Python 3.11+；也可手动填写 API 地址和 Key")
+            try:
+                with open(path, "rb") as f:
+                    config = tomllib.load(f)
+            except (ValueError, OSError):
+                raise ValueError("无法解析 Codex config.toml，请检查配置或手动填写 API 地址")
+        profile = (config.get("profiles") or {}).get(config.get("profile"), {}) or {}
+        provider_name = profile.get("model_provider") or config.get("model_provider")
+        provider = (config.get("model_providers") or {}).get(provider_name, {}) or {}
+        api_base = provider.get("base_url")
+        if not api_base:
+            if provider_name and provider_name != "openai":
+                raise ValueError("当前供应商缺少 base_url，请手动填写 API 地址")
+            return None, None
+        api_format = api_format or provider.get("wire_api") or "responses"
+        if not api_key:
+            env_key = provider.get("env_key")
+            if env_key:
+                api_key = os.environ.get(env_key)
+                if not api_key:
+                    raise ValueError("当前供应商所需的环境变量未设置: " + env_key)
+            else:
+                api_key = provider.get("experimental_bearer_token")
+                if not api_key:
+                    try:
+                        with open(os.path.join(codex_home, "auth.json"), encoding="utf-8") as f:
+                            api_key = json.load(f).get("OPENAI_API_KEY")
+                    except (OSError, ValueError):
+                        pass
+    base = api_base.rstrip("/")
+    parts = urlsplit(base)
+    if parts.scheme not in ("http", "https") or not parts.netloc or parts.query or parts.fragment:
+        raise ValueError("API 地址必须是完整的 http(s) URL，且不包含查询参数或片段")
+    if parts.username or parts.password:
+        raise ValueError("请在 API Key 字段填写凭据")
+    if not base.endswith(("/responses", "/chat/completions")):
+        api_format = api_format or "chat"
+        if api_format not in ("responses", "chat", "chat/completions"):
+            raise ValueError("不支持的 API 协议: " + api_format)
+        endpoint = "responses" if api_format == "responses" else "chat/completions"
+        base += ("/" if parts.path.rstrip("/") else "/v1/") + endpoint
+    if not api_key:
+        raise ValueError("第三方 API 缺少 Key，请填写 --api-key、面板 Key 或供应商凭据")
+    return base, api_key
+
+
+def _api_ask(url, key, model, prompt, effort, want_reasoning=False):
     import urllib.request
     import urllib.error
+    responses = url.endswith("/responses")
+    payload = {"model": model, "stream": True}
+    if responses:
+        payload.update({
+            "instructions": "You are a helpful assistant.",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+            "store": False, "reasoning": {"effort": effort},
+        })
+    else:
+        payload.update({"messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 3000, "reasoning_effort": effort})
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST")
+    for k, v in (("Authorization", "Bearer " + key), ("Content-Type", "application/json"),
+                 ("Accept", "text/event-stream"), ("User-Agent", "codex-model-watch")):
+        req.add_header(k, v)
+    t0 = time.monotonic()
+    result = {"text": "", "served": "", "ttft_ms": None, "reasoning": 0,
+              "safety_header": "", "error": None}
+    deltas, reasoning_chars, usage_tokens = [], 0, None
+
+    def consume(data):
+        nonlocal reasoning_chars, usage_tokens
+        if data.get("error") or data.get("type") in ("error", "response.failed", "response.incomplete"):
+            result["error"] = "API 返回错误或未完成响应"
+            return
+        response = data.get("response") or data
+        result["served"] = response.get("model") or result["served"]
+        usage = response.get("usage") or {}
+        details = usage.get("output_tokens_details") or usage.get("completion_tokens_details") or {}
+        if "reasoning_tokens" in details:
+            usage_tokens = details["reasoning_tokens"]
+        kind = data.get("type", "")
+        if kind == "response.output_text.delta":
+            deltas.append(data.get("delta") or "")
+        elif kind in ("response.reasoning_text.delta", "response.reasoning_summary_text.delta"):
+            reasoning_chars += len(data.get("delta") or "")
+        elif not kind:
+            choices = data.get("choices") or []
+            if choices:
+                msg = choices[0].get("delta") or choices[0].get("message") or {}
+                deltas.append(msg.get("content") or "")
+                reasoning_chars += len(msg.get("reasoning_content") or msg.get("reasoning") or "")
+        if not deltas and response.get("output"):
+            for item in response["output"]:
+                for content in item.get("content") or []:
+                    if content.get("type") == "output_text":
+                        deltas.append(content.get("text") or "")
+        if result["ttft_ms"] is None and (any(deltas) or reasoning_chars):
+            result["ttft_ms"] = int((time.monotonic() - t0) * 1000)
+
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            result["safety_header"] = resp.headers.get("x-codex-safety-buffering-enabled", "")
+            if "text/event-stream" in resp.headers.get("Content-Type", ""):
+                event_lines = []
+                for line in resp:
+                    line = line.decode("utf-8").rstrip("\r\n")
+                    if line.startswith("data:"):
+                        event_lines.append(line[5:].lstrip(" "))
+                    elif not line and event_lines:
+                        raw = "\n".join(event_lines)
+                        event_lines = []
+                        if raw == "[DONE]":
+                            break
+                        data = json.loads(raw)
+                        consume(data)
+                        if data.get("type") in ("response.completed", "response.failed", "response.incomplete"):
+                            break
+                if event_lines and event_lines != ["[DONE]"]:
+                    consume(json.loads("\n".join(event_lines)))
+            else:
+                consume(json.load(resp))
+        result["text"] = "".join(deltas).strip()
+        result["reasoning"] = (usage_tokens if usage_tokens is not None else reasoning_chars) if want_reasoning else 0
+        result["reasoning_unit"] = "tokens" if usage_tokens is not None else "characters"
+        if not result["served"] and not result["text"] and not result["error"]:
+            result["error"] = "响应里没有找到模型或输出字段"
+    except urllib.error.HTTPError as e:
+        result["error"] = "HTTP %d（请检查 API 地址、Key、模型和协议）" % e.code
+    except Exception:
+        result["error"] = "第三方 API 请求或响应解析失败，请检查连接与接口协议"
+    result["latency_ms"] = int((time.monotonic() - t0) * 1000)
+    return result
+
+
+def run_probe(codex_home, model, api_base=None, api_key=None):
+    import urllib.request
+    import urllib.error
+    try:
+        api_base, api_key = resolve_api(codex_home, api_base, api_key)
+    except ValueError as e:
+        return {"error": str(e)}
+    if api_base:
+        result = _api_ask(api_base, api_key, model, "hi", "low")
+        served = result["served"]
+        error = result["error"] or (None if served else "响应里没有找到模型字段，无法比较模型")
+        swapped = bool(served and served != model)
+        ts = iso_now()
+        with g_lock:
+            connection = db_connect(db_path())
+            try:
+                connection.execute(
+                    "INSERT INTO probes(ts, requested, served, swapped, latency_ms, safety_header, error) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (ts, model, served, int(swapped), result["latency_ms"], result["safety_header"], error))
+                connection.commit()
+            finally:
+                connection.close()
+        return dict(result, ts=ts, requested=model, swapped=swapped, error=error)
     auth = load_auth(codex_home)
     if not auth:
         return {"error": "未找到 Codex 登录态（~/.codex/auth.json），请先用 Codex 登录"}
@@ -478,40 +643,18 @@ def run_identify(model, codex_home, api_base=None, api_key=None,
 
 
 def _post_ask(model, prompt, effort, codex_home, api_base=None, api_key=None, want_reasoning=False):
-    """通用单次提问：官方 backend（SSE）或中转站（chat/completions）。
-    返回 dict(text, ttft_ms, reasoning, error)。reasoning：官方通道取 reasoning_tokens，
-    中转通道取推理字符数（阈值在使用侧放大）。"""
+    """通用单次提问：官方 backend 或第三方 Responses / Chat Completions。
+    reasoning 优先使用 usage 的 token 数，没有 usage 时用推理字符数。"""
     import urllib.request
     import urllib.error
     import re as _re
     t0 = time.time()
+    try:
+        api_base, api_key = resolve_api(codex_home, api_base, api_key)
+    except ValueError as e:
+        return {"text": "", "ttft_ms": None, "reasoning": 0, "error": str(e)}
     if api_base:
-        url = api_base.rstrip("/") + "/v1/chat/completions"
-        body = json.dumps({"model": model, "max_tokens": 3000, "reasoning_effort": effort,
-                           "messages": [{"role": "user", "content": prompt}]}).encode()
-        req = urllib.request.Request(url, data=body, method="POST")
-        req.add_header("Authorization", "Bearer " + (api_key or ""))
-        req.add_header("Content-Type", "application/json")
-        req.add_header("User-Agent", "codex_cli_rs/0.155.0")
-        try:
-            resp = urllib.request.urlopen(req, timeout=180)
-            raw = resp.read().decode(errors="replace")
-            ttft = int((time.time() - t0) * 1000)  # 非流式只能拿总时长当上界
-            try:
-                d = json.loads(raw)
-                msg = (d.get("choices") or [{}])[0].get("message") or {}
-                rc = len(str(msg.get("reasoning_content") or msg.get("reasoning") or "")) \
-                    if want_reasoning else 0
-                return {"text": str(msg.get("content") or "").strip(), "ttft_ms": ttft,
-                        "reasoning": rc, "error": None}
-            except Exception:
-                return {"text": "", "ttft_ms": ttft, "reasoning": 0,
-                        "error": "响应解析失败: " + raw[:120]}
-        except urllib.error.HTTPError as e:
-            return {"text": "", "ttft_ms": None, "reasoning": 0,
-                    "error": "HTTP %d %s" % (e.code, e.read(200).decode(errors="replace"))}
-        except Exception as e:
-            return {"text": "", "ttft_ms": None, "reasoning": 0, "error": str(e)[:200]}
+        return _api_ask(api_base, api_key, model, prompt, effort, want_reasoning)
     auth = load_auth(codex_home)
     if not auth:
         return {"text": "", "ttft_ms": None, "reasoning": 0,
@@ -687,8 +830,9 @@ def run_canary(model, codex_home, api_base=None, api_key=None):
         verdict = "error"
     else:
         fast = (ttft_ms or 0) < CANARY_TTFT_SUSPECT_MS
-        # 官方通道有真 reasoning_tokens；中转通道是字符数，阈值放大 5 倍
-        shallow = (reasoning or 0) < (CANARY_REASON_SUSPECT * (1 if api_base else 5))
+        # 有 usage 时比较 token 数；仅有推理文本时使用字符数阈值。
+        shallow = (reasoning or 0) < (CANARY_REASON_SUSPECT *
+                                    (5 if ca.get("reasoning_unit") == "characters" else 1))
         # 判定 v3：知识实测最硬——知道截止后事实 = 不是旧壳（自报 2024-06 视为幻觉）；
         # 答错全部截止后事实 = 旧壳实锤；没测出时才退回自报指纹。
         if knows_modern is False:
@@ -844,7 +988,8 @@ def seed_demo(conn):
                         VALUES('demo', ?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(file, turn_id) DO NOTHING""",
                      [(t[0],) + t[1:] for t in turns])
     conn.executemany("INSERT INTO quota VALUES(?,?,?,?) ON CONFLICT(ts) DO NOTHING", quota)
-    conn.executemany("INSERT INTO probes VALUES(?,?,?,?,?,?,?) ON CONFLICT(ts) DO NOTHING", probes)
+    conn.executemany("INSERT INTO probes(ts, requested, served, swapped, latency_ms, safety_header, error) "
+                     "VALUES(?,?,?,?,?,?,?) ON CONFLICT(ts) DO NOTHING", probes)
     conn.commit()
 
 
@@ -914,17 +1059,23 @@ class Handler(BaseHTTPRequestHandler):
             if not model:
                 self._json({"error": "缺少 model"}, 400)
                 return
+            try:
+                api_base, api_key = resolve_api(
+                    g_args.codex_home, body.get("api_base") or g_args.api_base,
+                    body.get("api_key") or g_args.api_key,
+                    body.get("api_format") or g_args.api_format or None)
+            except ValueError as e:
+                self._json({"error": str(e)}, 400)
+                return
             if body.get("battery"):
                 result = run_battery(model, g_args.codex_home,
-                                     api_base=body.get("api_base") or g_args.api_base,
-                                     api_key=body.get("api_key") or g_args.api_key,
+                                     api_base=api_base, api_key=api_key,
                                      ref_model=body.get("ref_model"))
             elif body.get("canary"):
                 result = run_canary(model, g_args.codex_home,
-                                    api_base=body.get("api_base") or g_args.api_base,
-                                    api_key=body.get("api_key") or g_args.api_key)
+                                    api_base=api_base, api_key=api_key)
             else:
-                result = run_probe(g_args.codex_home, model)
+                result = run_probe(g_args.codex_home, model, api_base, api_key)
             self._json(result)
             return
         self.send_response(404)
@@ -954,13 +1105,14 @@ def main():
     global g_args, g_last_scan
     ap = argparse.ArgumentParser(description="codex-model-watch —— 本地监控 Codex 模型使用/额度/拒单，并探测模型偷换")
     ap.add_argument("--port", type=int, default=8787, help="本地网页端口（默认 8787）")
-    ap.add_argument("--codex-home", default=os.path.join(HOME, ".codex"), help="Codex 主目录（默认 ~/.codex）")
+    ap.add_argument("--codex-home", default=os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex"), help="Codex 主目录（默认 CODEX_HOME 或 ~/.codex）")
     ap.add_argument("--max-age-days", type=int, default=30, help="只解析最近 N 天的会话日志，0=全部（默认 30）")
     ap.add_argument("--demo", action="store_true", help="使用内置演示数据（不读取真实日志）")
     ap.add_argument("--scan-only", action="store_true", help="只扫描解析并打印摘要，不启动网页")
     ap.add_argument("--no-open", action="store_true", help="启动后不自动打开浏览器")
-    ap.add_argument("--api-base", default="", help="金丝雀探针打中转站地址（如 https://api.funyoo.uk），留空用本地官方登录态")
+    ap.add_argument("--api-base", default="", help="所有探针的第三方 API 地址；留空自动读取 Codex 当前供应商")
     ap.add_argument("--api-key", default="", help="中转站 API key（配合 --api-base）")
+    ap.add_argument("--api-format", choices=("responses", "chat"), default="", help="手动地址的接口协议（默认 chat）；自动配置读取 wire_api")
     g_args = ap.parse_args()
     g_state["demo"] = g_args.demo
 

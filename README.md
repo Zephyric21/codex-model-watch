@@ -97,6 +97,37 @@ python codex_model_watch.py --demo
 
 ## 探针怎么用
 
+### codex++ / 第三方 API
+
+快探针和深度金丝雀均支持第三方 API，无需官方 Codex 登录态。
+使用 Python 3.11+ 启动后，默认读取 `CODEX_HOME`（或 `~/.codex`）下的
+`config.toml` 当前 `model_provider`、`base_url` 和 `wire_api`。
+支持 codex++ 的 `experimental_bearer_token`、供应商 `env_key` 环境变量，
+以及纯 API 模式 `auth.json` 中的 `OPENAI_API_KEY`。每次探测重新读取配置。
+第三方请求不会使用官方 OAuth access token。
+
+```bash
+# 自动使用 codex++ 当前已切换的供应商（Python 3.11+）
+python3 codex_model_watch.py
+
+# 手动指定 Responses API（也支持 Python 3.8–3.10）
+python3 codex_model_watch.py --api-base https://你的中转站/v1 --api-key sk-xxx --api-format responses
+
+# Chat Completions API（手动地址默认协议）
+python3 codex_model_watch.py --api-base https://你的中转站/v1 --api-key sk-xxx --api-format chat
+```
+
+也可在面板填写 API 地址、Key 和协议，两种探测按钮共用这些设置。
+支持根地址、包含 `/v1` 的地址或完整接口地址；自定义路径按原样保留。
+手动地址的“自动”协议默认为 Chat Completions，Codex 配置则读取 `wire_api`。
+Key 只用于请求，不返回前端、不写入历史、不保存到浏览器存储。
+若 codex++ 配置指向本地代理，需保持该代理运行。
+
+快探针比较的是服务端报告的模型字段；字段一致不能证明底层模型身份，
+金丝雀也只是行为线索，不能作为模型身份的确定证据。
+
+### 官方登录模式
+
 1. 先用 Codex 正常登录一次（保证 `~/.codex/auth.json` 存在且未过期）；
 2. 打开面板，在「偷换探针」区输入要验证的请求模型（例如 `gpt-6-astra`）；
 3. 点「立即探测」，几秒后显示：**请求 X → 实际派出 Y**，一致或被偷换一目了然；
